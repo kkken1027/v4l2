@@ -34,6 +34,7 @@ all: $(OBJ) $(TARGET)
 
 $(TARGET): $(TARGET).cpp $(OBJ)
 	$(MY_CC) -o $@ $^ $(CFLAGS) $(patsubst %,-I%,$(INC))
+#	mv $(TARGET) v4l2
 
 %.o: %.cpp
 	$(MY_CC) -c $< -o $@ $(CFLAGS)

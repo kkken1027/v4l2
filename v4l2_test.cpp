@@ -28,10 +28,21 @@ using namespace std;
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
+typedef enum
+{
+	I420, //yyyy.....uu....vv...
+	YV12, //yyyy.....vv....uu...
+	NV21, //yyyy.....vuvu....
+	NV12  //yyyy.....uvuv....
+} pix_fmt;
+
 int g_width  = 1920;
 int g_height = 1080;
 int g_vnode  = 0;
-int g_pixfmt  = 0;
+int g_pixfmt = 0;
+int g_recfmt = NV21;
+int g_recframe = 0;
+char g_recfile[32];
 
 class V4L2Capture {
 public:
@@ -286,12 +297,138 @@ int V4L2Capture::backFrame() {
 	return -1;
 }
 
+//yuvI420 to yuv420sp, yyyy....uu....vv.... to NV21 (yyyy.....vuvu) or NV12 (yyyy.....uvuv)
+int yuvI420_2_nv(char* nv21, char* yuv420, int width, int height, int mode)
+{
+    char *y, *vu;
+    int index_y, index_u, index_v;
+    int i, j;
+
+    if(mode != NV12 && mode != NV21){
+        printf("Failed!! mode select NV12(%d) or NV21(%d), current mode is %d\n", NV12, NV21, mode);
+        return -1;
+    }
+    y  = nv21;
+    vu = nv21 + (width * height);
+
+    for(j=0; j< height; j++)
+    {
+        for(i=0; i<width; i++)
+        {
+            *(y++) = yuv420[i + width*j];
+        }
+    }
+
+    for(j=0; j< (width * height)/4; j++)
+    {
+    	if(mode == NV12){
+    	    *(vu++) = yuv420[width * height + j];
+    	    *(vu++) = yuv420[(int)((width * height)*5/4) + j];
+    	}else if(mode == NV21){
+    	    *(vu++) = yuv420[(int)((width * height)*5/4) + j];
+    	    *(vu++) = yuv420[width * height + j];
+    	}
+    }
+    return 0;
+}
+
+//yuvI420 to yuv420sp, yyyy....vv....uu.... to NV21 (yyyy.....vuvu) or NV12 (yyyy.....uvuv)
+int yv12_2_nv(char* nv21, char* yuv420, int width, int height, int mode)
+{
+    char *y, *vu;
+    int index_y, index_u, index_v;
+    int i, j;
+
+    if(mode != NV12 && mode != NV21){
+        printf("Failed!! mode select NV12(%d) or NV21(%d), current mode is %d\n", NV12, NV21, mode);
+        return -1;
+    }
+    y  = nv21;
+    vu = nv21 + (width * height);
+
+    for(j=0; j< height; j++)
+    {
+        for(i=0; i<width; i++)
+        {
+            *(y++) = yuv420[i + width*j];
+        }
+    }
+
+    for(j=0; j< (width * height)/4; j++)
+    {
+    	if(mode == NV21){
+    	    *(vu++) = yuv420[width * height + j];
+    	    *(vu++) = yuv420[(int)((width * height)*5/4) + j];
+    	}else if(mode == NV12){
+    	    *(vu++) = yuv420[(int)((width * height)*5/4) + j];
+    	    *(vu++) = yuv420[width * height + j];
+    	}
+    }
+    return 0;
+}
+
+//yuv422 to yuv420p, yuyv.... to I420 (yyyy....uu....vv...) or YV12 (yyyy....vv....uu...)
+int yuv422_2_yuv420(char* yuv420, char* yuv422, int width, int height, int mode)
+{
+	int imgSize = width * height * 2;
+	int widthStep422 = width * 2;
+	char* p422 = yuv422;
+	char* p420y = yuv420;
+	char* p420u;
+	char* p420v;
+
+	if(mode == I420){
+		//CV_YUV2BGR_I420  yyyy.....uu....vv...
+	    p420u = yuv420 + imgSize / 2;
+	    p420v = p420u + imgSize / 8;
+	}else if(mode == YV12){
+		//CV_YUV2BGR_YV12  yyyy.....vv....uu...
+		p420v = yuv420 + imgSize / 2;
+		p420u = p420v + imgSize / 8;
+	}else{
+		printf("Failed!! mode select I420(%d) or YV12(%d), current mode is %d\n", I420, YV12, mode);
+		return -1;
+	}
+
+	for(int i = 0; i < height; i += 2)
+	{
+		p422 = yuv422 + i * widthStep422;
+		for(int j = 0; j < widthStep422; j+=4)
+		{
+			*(p420y++) = p422[j];
+			*(p420u++) = p422[j+1];
+			*(p420y++) = p422[j+2];
+		}
+		p422 += widthStep422;
+		for(int j = 0; j < widthStep422; j+=4)
+		{
+			*(p420y++) = p422[j];
+			*(p420v++) = p422[j+3];
+			*(p420y++) = p422[j+2];
+		}
+	}
+	return 0;
+}
+
 void VideoPlayer_YUV422(int w, int h, string videoDev) {
 	unsigned long yuvframeSize = 0;
-    cv::Mat yuvImg, rgbImg;
+    cv::Mat yuvImg, rgbImg, outNV21, yuv420;
     yuvImg.create(h, w, CV_8UC2);
     rgbImg.create(h, w, CV_8UC3);
+    yuv420.create(h*1.5, w, CV_8UC1);
+    outNV21.create(h*1.5, w, CV_8UC1);
     double tt;
+    int frame_cnt = 0;
+    int yuv_length = g_height * g_width * 1.5;
+    FILE * record_file = NULL;
+
+    if(strlen(g_recfile) != 0){
+    	printf("Start rec mode (%s)\n", g_recfile);
+		record_file = fopen(g_recfile, "wa+");
+		if (record_file == NULL) {
+			printf("error : Open the file fail! \n");
+		}
+    }
 
 	V4L2Capture *vcap = new V4L2Capture(const_cast<char*>(videoDev.c_str()), w, h, V4L2_PIX_FMT_YUYV);
 	vcap->openDevice();
@@ -302,15 +439,28 @@ void VideoPlayer_YUV422(int w, int h, string videoDev) {
     	tt = (double)cvGetTickCount();
 		vcap->getFrame((void **) &yuvImg.data, (size_t *)&yuvframeSize);
 
-		cv::cvtColor(yuvImg, rgbImg, CV_YUV2BGR_YUYV);
-		cv::imshow("YUV422", rgbImg);
+		if(record_file != NULL){
+			yuv422_2_yuv420((char *)yuv420.data, (char *)yuvImg.data, g_width, g_height, I420);
+			yuvI420_2_nv((char *)outNV21.data, (char *)yuv420.data, g_width, g_height, g_recfmt);
+			fwrite((char *)outNV21.data, yuv_length, 1, record_file);
+			//for check use https://docs.opencv.org/3.1.0/df/d4e/group__imgproc__c.html
+			cv::cvtColor(outNV21, rgbImg, CV_YUV2BGR_NV21);
+		}else{
+		    cv::cvtColor(yuvImg, rgbImg, CV_YUV2BGR_YUYV);
+		}
 
+		cv::imshow("VideoPlayer", rgbImg);
 		vcap->backFrame();
 		if((cv::waitKey(1)&255) == 27)
 			exit(0);
 
+		if(frame_cnt++ > g_recframe && g_recframe)
+			break;
 		printf("Capture one frame time is %g ms\n",( ((double)cvGetTickCount() - tt) / (cvGetTickFrequency()*1000)));
 	}
+
+	if (record_file != NULL)
+		fclose(record_file);
 
     vcap->stopCapture();
 	vcap->freeBuffers();
@@ -400,12 +550,26 @@ void parse_opt(int argc, char** argv)
 				str.push_back(strtok (NULL, "*"));
 				g_width = atoi(str[0]);
 				g_height = atoi(str[1]);
+			}else if(!strcmp(argv[i], "-recfile")){
+				strcpy(g_recfile, argv[++i]);
+			}else if(!strcmp(argv[i], "-recframe")){
+				g_recframe = atoi(argv[++i]);
+			}else if(!strcmp(argv[i], "-recfmt")){
+				g_recfmt = atoi(argv[++i]);
 			}
 		}
     }
+    printf("===============Video Info S ===============\n");
+    printf("Open device: /dev/video%d\nCamera outout format: %s\nResulation: %d x %d\n"
+    		, g_vnode, g_pixfmt? "MJPEG":"YUYV", g_width, g_height);
+    if(strlen(g_recfile) != 0){
+        printf("Recorder file: %s\nRecorder frame: %d\nRecorder format: %d\n", g_recfile, g_recframe, g_recfmt);
+        printf("\t%d)I420 %d)YV12 %d)NV21 %d)NV12\n", I420, YV12, NV21, NV12);
+    }
+    printf("===============Video Info E ===============\n");
 }
-// ./v4l2_mjpeg_test -camera 0 -res 1920*1080 -fmt 1
 
+// ./v4l2_mjpeg_test -camera 0 -res 1920*1080 -fmt 1
 int main(int argc, char** argv) {
 
 	parse_opt(argc, argv);
